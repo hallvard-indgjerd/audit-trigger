@@ -49,8 +49,11 @@ client_query text,
 action TEXT NOT NULL CHECK (action IN ('I', 'D', 'U', 'T')),
 row_data jsonb,
 changed_fields jsonb,
+old_data jsonb,
+new_data jsonb,
 statement_only boolean not null,
-row_id bigint
+row_uuid uuid,
+actor_uuid uuid
 );
 REVOKE ALL ON audit.logged_actions
 FROM public;
@@ -71,7 +74,11 @@ COMMENT ON COLUMN audit.logged_actions.application_name IS 'Application name set
 COMMENT ON COLUMN audit.logged_actions.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
 COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
+COMMENT ON COLUMN audit.logged_actions.old_data IS 'Old values of fields changed. For use by diff viewer.';
+COMMENT ON COLUMN audit.logged_actions.new_data IS 'New values of fields changed. For use by diff viewer.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
+COMMENT ON COLUMN audit.logged_actions.row_uuid IS 'UUID of the changed row';
+COMMENT ON COLUMN audit.logged_actions.actor_uuid IS 'UUID of the actor, taken from updated_by in new_data for INSERT and UPDATE';
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
@@ -116,9 +123,12 @@ audit_row = ROW(
     -- action
     NULL,
     NULL,
-    -- row_data, changed_fields
+    NULL,
+    NULL,
+    -- row_data, changed_fields, old_data, new_data
     'f', -- statement_only,
-    COALESCE(OLD.id, NULL) -- pk ID of the row
+    COALESCE(OLD.uuid, NULL), -- pk ID of the row
+    COALESCE(NEW.updated_by, NULL), -- actor uuid of the row
 );
 IF NOT TG_ARGV [0]::boolean IS DISTINCT
 FROM 'f'::boolean THEN audit_row.client_query = NULL;
@@ -187,7 +197,7 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
 DECLARE stm_targets text = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
 _q_txt text;
 _ignored_cols_snip text = '';
-BEGIN PERFORM deaudit_table(target_table);
+BEGIN PERFORM audit.deaudit_table(target_table);
 IF audit_rows THEN IF array_length(ignored_cols, 1) > 0 THEN _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
 END IF;
 _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER ' || CASE
@@ -249,11 +259,11 @@ SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', BOOLEAN 't');
 $body$ LANGUAGE 'sql';
 COMMENT ON FUNCTION audit.audit_table(regclass) IS $body$
 Add auditing support to the given table.Row - level changes will be logged with full client query text.No cols are ignored.$body$;
-CREATE OR REPLACE FUNCTION deaudit_table(target_table regclass) RETURNS void AS $body$ BEGIN EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table;
+CREATE OR REPLACE FUNCTION audit.deaudit_table(target_table regclass) RETURNS void AS $body$ BEGIN EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table;
 EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table;
 END;
 $body$ language 'plpgsql';
-COMMENT ON FUNCTION deaudit_table(regclass) IS $body$ Remove auditing support to the given table.$body$;
+COMMENT ON FUNCTION audit.deaudit_table(regclass) IS $body$ Remove auditing support to the given table.$body$;
 CREATE OR REPLACE VIEW audit.tableslist AS
 SELECT DISTINCT triggers.trigger_schema AS schema,
     triggers.event_object_table AS auditedtable
