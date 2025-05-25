@@ -53,7 +53,9 @@ old_data jsonb,
 new_data jsonb,
 statement_only boolean not null,
 row_uuid uuid,
-actor_uuid uuid
+actor_uuid uuid,
+uuid uuid NOT NULL DEFAULT gen_random_uuid(),
+archived boolean NOT NULL DEFAULT false
 );
 REVOKE ALL ON audit.logged_actions
 FROM public;
@@ -79,9 +81,12 @@ COMMENT ON COLUMN audit.logged_actions.new_data IS 'New values of fields changed
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 COMMENT ON COLUMN audit.logged_actions.row_uuid IS 'UUID of the changed row';
 COMMENT ON COLUMN audit.logged_actions.actor_uuid IS 'UUID of the actor, taken from updated_by in new_data for INSERT and UPDATE';
+COMMENT ON COLUMN audit.logged_actions.uuid IS 'UUID of logged action. Not currently pkey, but used for compatibility with web interface.';
+COMMENT ON COLUMN audit.logged_actions.archived IS 'Boolean value to indicate if the logged action has been archived and should not be displayed to users.';
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
+CREATE INDEX logged_actions_action_uuid ON audit.logged_actions(uuid);
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
     audit_row audit.logged_actions;
@@ -129,6 +134,8 @@ audit_row = ROW(
     'f', -- statement_only,
     COALESCE(OLD.uuid, NULL), -- pk ID of the row
     COALESCE(NEW.updated_by, NULL), -- actor uuid of the row
+    gen_random_uuid(), -- UUID of the logged action
+    false -- archived
 );
 IF NOT TG_ARGV [0]::boolean IS DISTINCT
 FROM 'f'::boolean THEN audit_row.client_query = NULL;
@@ -138,26 +145,34 @@ END IF;
 IF (
     TG_OP = 'UPDATE'
     AND TG_LEVEL = 'ROW'
-) THEN audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
---Computing differences
-SELECT jsonb_object_agg(tmp_new_row.key, tmp_new_row.value) AS new_data INTO audit_row.changed_fields
-FROM jsonb_each_text(row_to_json(NEW)::JSONB) AS tmp_new_row
-    JOIN jsonb_each_text(audit_row.row_data) AS tmp_old_row ON (
-        tmp_new_row.key = tmp_old_row.key
-        AND tmp_new_row.value IS DISTINCT
-        FROM tmp_old_row.value
-    );
-IF audit_row.changed_fields = '{}'::JSONB THEN -- All changed fields are ignored. Skip this update.
-RETURN NULL;
-END IF;
+) THEN 
+    audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
+    audit_row.old_data = row_to_json(OLD)::JSONB - excluded_cols;
+    audit_row.new_data = row_to_json(NEW)::JSONB - excluded_cols;
+    
+    --Computing differences
+    SELECT jsonb_object_agg(tmp_new_row.key, tmp_new_row.value) AS new_data INTO audit_row.changed_fields
+    FROM jsonb_each_text(row_to_json(NEW)::JSONB) AS tmp_new_row
+        JOIN jsonb_each_text(audit_row.row_data) AS tmp_old_row ON (
+            tmp_new_row.key = tmp_old_row.key
+            AND tmp_new_row.value IS DISTINCT
+            FROM tmp_old_row.value
+        );
+    IF audit_row.changed_fields = '{}'::JSONB THEN -- All changed fields are ignored. Skip this update.
+    RETURN NULL;
+    END IF;
 ELSIF (
     TG_OP = 'DELETE'
     AND TG_LEVEL = 'ROW'
-) THEN audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
+) THEN 
+    audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
+    audit_row.old_data = row_to_json(OLD)::JSONB - excluded_cols;
 ELSIF (
     TG_OP = 'INSERT'
     AND TG_LEVEL = 'ROW'
-) THEN audit_row.row_data = row_to_json(NEW)::JSONB - excluded_cols;
+) THEN 
+    audit_row.row_data = row_to_json(NEW)::JSONB - excluded_cols;
+    audit_row.new_data = row_to_json(NEW)::JSONB - excluded_cols;
 ELSIF (
     TG_LEVEL = 'STATEMENT'
     AND TG_OP IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
