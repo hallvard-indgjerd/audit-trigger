@@ -87,6 +87,40 @@ CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
 CREATE INDEX logged_actions_action_uuid ON audit.logged_actions(uuid);
+-- Helper function to get primary key column name
+CREATE OR REPLACE FUNCTION audit.get_primary_key_column(table_name text, schema_name text DEFAULT 'public')
+RETURNS text AS $$
+DECLARE
+    pk_column text;
+BEGIN
+    SELECT a.attname INTO pk_column
+    FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+    JOIN pg_class c ON c.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE i.indisprimary
+    AND c.relname = table_name
+    AND n.nspname = schema_name
+    LIMIT 1;
+    
+    RETURN pk_column;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function to safely extract field value from jsonb
+CREATE OR REPLACE FUNCTION audit.safe_extract_field(data jsonb, field_name text)
+RETURNS text AS $$
+BEGIN
+    IF data ? field_name THEN
+        RETURN data ->> field_name;
+    END IF;
+    RETURN NULL;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
     audit_row audit.logged_actions;
@@ -95,8 +129,66 @@ DECLARE
     h_old jsonb;
     h_new jsonb;
     excluded_cols text [] = ARRAY []::text [];
+    pk_column text;
+    row_uuid_value text := NULL;
+    actor_uuid_value text := NULL;
     BEGIN IF TG_WHEN <> 'AFTER' THEN RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
 END IF;
+
+-- Detect primary key column
+pk_column := audit.get_primary_key_column(TG_TABLE_NAME, TG_TABLE_SCHEMA);
+
+-- Extract row UUID safely
+BEGIN
+    IF TG_OP = 'DELETE' AND OLD IS NOT NULL THEN
+        -- Try primary key first, then common field names
+        IF pk_column IS NOT NULL THEN
+            row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), pk_column);
+        END IF;
+        
+        IF row_uuid_value IS NULL THEN
+            -- Try common UUID field names
+            IF to_jsonb(OLD) ? 'uuid' THEN
+                row_uuid_value := OLD.uuid::text;
+            ELSIF to_jsonb(OLD) ? 'id' THEN
+                row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), 'id');
+            ELSIF to_jsonb(OLD) ? 'value' THEN
+                row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), 'value');
+            END IF;
+        END IF;
+    ELSIF NEW IS NOT NULL THEN
+        -- Try primary key first, then common field names
+        IF pk_column IS NOT NULL THEN
+            row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), pk_column);
+        END IF;
+        
+        IF row_uuid_value IS NULL THEN
+            -- Try common UUID field names
+            IF to_jsonb(NEW) ? 'uuid' THEN
+                row_uuid_value := NEW.uuid::text;
+            ELSIF to_jsonb(NEW) ? 'id' THEN
+                row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'id');
+            ELSIF to_jsonb(NEW) ? 'value' THEN
+                row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'value');
+            END IF;
+        END IF;
+        
+        -- Extract actor UUID safely
+        IF to_jsonb(NEW) ? 'updated_by' THEN
+            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'updated_by');
+        ELSIF to_jsonb(NEW) ? 'actor_uuid' THEN
+            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'actor_uuid');
+        ELSIF to_jsonb(NEW) ? 'user_id' THEN
+            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'user_id');
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        -- If all extraction fails, leave as NULL
+        row_uuid_value := NULL;
+        actor_uuid_value := NULL;
+END;
+
 audit_row = ROW(
     nextval('audit.logged_actions_event_id_seq'),
     -- event_id
@@ -132,8 +224,8 @@ audit_row = ROW(
     NULL,
     -- row_data, changed_fields, old_data, new_data
     'f', -- statement_only,
-    COALESCE(OLD.uuid, NULL), -- pk ID of the row
-    COALESCE(NEW.updated_by, NULL), -- actor uuid of the row
+    row_uuid_value::uuid, -- safely extracted row UUID
+    actor_uuid_value::uuid, -- safely extracted actor UUID
     gen_random_uuid(), -- UUID of the logged action
     false -- archived
 );
