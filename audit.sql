@@ -123,160 +123,140 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
-    audit_row audit.logged_actions;
-    include_values boolean;
-    log_diffs boolean;
-    h_old jsonb;
-    h_new jsonb;
-    excluded_cols text [] = ARRAY []::text [];
-    pk_column text;
-    row_uuid_value text := NULL;
-    actor_uuid_value text := NULL;
-    BEGIN IF TG_WHEN <> 'AFTER' THEN RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
-END IF;
+  audit_row audit.logged_actions;
+  include_values boolean;
+  log_diffs boolean;
+  h_old jsonb := to_jsonb(OLD);
+  h_new jsonb := to_jsonb(NEW);
+  excluded_cols text[] := ARRAY[]::text[];
+  pk_column text;
+  row_uuid text := NULL;
+  actor_uuid text := NULL;
+  old_filtered jsonb;
+  new_filtered jsonb;
+BEGIN
+  IF TG_WHEN <> 'AFTER' THEN
+    RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
+  END IF;
 
 -- Detect primary key column
 pk_column := audit.get_primary_key_column(TG_TABLE_NAME, TG_TABLE_SCHEMA);
+--RAISE NOTICE 'pk=%', pk_column;
+--RAISE NOTICE 'level=%', TG_LEVEL;
+--RAISE NOTICE 'TG_OP=%', TG_OP;
+--RAISE NOTICE 'h_new=%', h_new;
+--RAISE NOTICE 'h_old=%', h_old;
 
 -- Extract row UUID safely
-BEGIN
-    IF TG_OP = 'DELETE' AND OLD IS NOT NULL THEN
-        -- Try primary key first, then common field names
-        IF pk_column IS NOT NULL THEN
-            row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), pk_column);
-        END IF;
-        
-        IF row_uuid_value IS NULL THEN
-            -- Try common UUID field names
-            IF to_jsonb(OLD) ? 'uuid' THEN
-                row_uuid_value := OLD.uuid::text;
-            ELSIF to_jsonb(OLD) ? 'id' THEN
-                row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), 'id');
-            ELSIF to_jsonb(OLD) ? 'value' THEN
-                row_uuid_value := audit.safe_extract_field(to_jsonb(OLD), 'value');
-            END IF;
-        END IF;
-    ELSIF NEW IS NOT NULL THEN
-        -- Try primary key first, then common field names
-        IF pk_column IS NOT NULL THEN
-            row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), pk_column);
-        END IF;
-        
-        IF row_uuid_value IS NULL THEN
-            -- Try common UUID field names
-            IF to_jsonb(NEW) ? 'uuid' THEN
-                row_uuid_value := NEW.uuid::text;
-            ELSIF to_jsonb(NEW) ? 'id' THEN
-                row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'id');
-            ELSIF to_jsonb(NEW) ? 'value' THEN
-                row_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'value');
-            END IF;
-        END IF;
-        
-        -- Extract actor UUID safely
-        IF to_jsonb(NEW) ? 'updated_by' THEN
-            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'updated_by');
-        ELSIF to_jsonb(NEW) ? 'actor_uuid' THEN
-            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'actor_uuid');
-        ELSIF to_jsonb(NEW) ? 'user_id' THEN
-            actor_uuid_value := audit.safe_extract_field(to_jsonb(NEW), 'user_id');
-        END IF;
-    END IF;
-EXCEPTION
-    WHEN OTHERS THEN
-        -- If all extraction fails, leave as NULL
-        row_uuid_value := NULL;
-        actor_uuid_value := NULL;
-END;
-
-audit_row = ROW(
-    nextval('audit.logged_actions_event_id_seq'),
-    -- event_id
-    TG_TABLE_SCHEMA::text,
-    -- schema_name
-    TG_TABLE_NAME::text,
-    -- table_name
-    TG_RELID,
-    -- relation OID for much quicker searches
-    session_user::text,
-    -- session_user_name
-    current_timestamp,
-    -- action_tstamp_tx
-    statement_timestamp(),
-    -- action_tstamp_stm
-    clock_timestamp(),
-    -- action_tstamp_clk
-    txid_current(),
-    -- transaction ID
-    current_setting('application_name'),
-    -- client application
-    inet_client_addr(),
-    -- client_addr
-    inet_client_port(),
-    -- client_port
-    current_query(),
-    -- top-level query or queries (if multistatement) from client
-    substring(TG_OP, 1, 1),
-    -- action
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    -- row_data, changed_fields, old_data, new_data
-    'f', -- statement_only,
-    row_uuid_value::uuid, -- safely extracted row UUID
-    actor_uuid_value::uuid, -- safely extracted actor UUID
-    gen_random_uuid(), -- UUID of the logged action
-    false -- archived
-);
-IF NOT TG_ARGV [0]::boolean IS DISTINCT
-FROM 'f'::boolean THEN audit_row.client_query = NULL;
-END IF;
-IF TG_ARGV [1] IS NOT NULL THEN excluded_cols = TG_ARGV [1]::text [];
-END IF;
-IF (
-    TG_OP = 'UPDATE'
-    AND TG_LEVEL = 'ROW'
-) THEN 
-    audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
-    audit_row.old_data = row_to_json(OLD)::JSONB - excluded_cols;
-    audit_row.new_data = row_to_json(NEW)::JSONB - excluded_cols;
-    
-    --Computing differences
-    SELECT jsonb_object_agg(tmp_new_row.key, tmp_new_row.value) AS new_data INTO audit_row.changed_fields
-    FROM jsonb_each_text(row_to_json(NEW)::JSONB) AS tmp_new_row
-        JOIN jsonb_each_text(audit_row.row_data) AS tmp_old_row ON (
-            tmp_new_row.key = tmp_old_row.key
-            AND tmp_new_row.value IS DISTINCT
-            FROM tmp_old_row.value
+    IF TG_OP = 'DELETE' AND h_old IS NOT NULL THEN
+    -- Try primary key first, then common field names
+        BEGIN
+        	IF pk_column IS NOT NULL THEN
+            	row_uuid := audit.safe_extract_field(h_old, pk_column);
+        	END IF;
+		EXCEPTION WHEN OTHERS THEN
+			RAISE NOTICE 'Exception in safe_extract_field';
+        	row_uuid := NULL;
+      	END;
+        row_uuid := COALESCE(
+        row_uuid,
+        h_old->>'uuid',
+        audit.safe_extract_field(h_old, 'id'),
+        audit.safe_extract_field(h_old, 'value')
         );
-    IF audit_row.changed_fields = '{}'::JSONB THEN -- All changed fields are ignored. Skip this update.
-    RETURN NULL;
+    ELSIF h_new IS NOT NULL THEN
+        -- Try primary key first, then common field names
+        BEGIN
+            IF pk_column IS NOT NULL THEN
+                row_uuid := audit.safe_extract_field(h_new, pk_column);
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Exception in safe_extract_field';
+            row_uuid := NULL;
+		END;
+        -- Try common UUID field names
+        row_uuid := COALESCE(
+        row_uuid,
+        h_new->>'uuid',
+        audit.safe_extract_field(h_new, 'id'),
+        audit.safe_extract_field(h_new, 'value')
+        );
+        -- Extract actor UUID safely
+        actor_uuid := COALESCE(
+        audit.safe_extract_field(h_new, 'updated_by'),
+        audit.safe_extract_field(h_new, 'actor_uuid'),
+        audit.safe_extract_field(h_new, 'user_id')
+        );
     END IF;
-ELSIF (
-    TG_OP = 'DELETE'
-    AND TG_LEVEL = 'ROW'
-) THEN 
-    audit_row.row_data = row_to_json(OLD)::JSONB - excluded_cols;
-    audit_row.old_data = row_to_json(OLD)::JSONB - excluded_cols;
-ELSIF (
-    TG_OP = 'INSERT'
-    AND TG_LEVEL = 'ROW'
-) THEN 
-    audit_row.row_data = row_to_json(NEW)::JSONB - excluded_cols;
-    audit_row.new_data = row_to_json(NEW)::JSONB - excluded_cols;
-ELSIF (
-    TG_LEVEL = 'STATEMENT'
-    AND TG_OP IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
-) THEN audit_row.statement_only = 't';
-ELSE RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger for unhandled case: %, %',
-TG_OP,
-TG_LEVEL;
-RETURN NULL;
-END IF;
-INSERT INTO audit.logged_actions
-VALUES (audit_row.*);
-RETURN NULL;
+
+    audit_row = ROW(
+        nextval('audit.logged_actions_event_id_seq'), -- event_id
+        TG_TABLE_SCHEMA::text, -- schema_name
+        TG_TABLE_NAME::text, -- table_name
+        TG_RELID, -- relation OID for much quicker searches
+        session_user::text, -- session_user_name
+        current_timestamp, -- action_tstamp_tx
+        statement_timestamp(), -- action_tstamp_stm
+        clock_timestamp(), -- action_tstamp_clk
+        txid_current(), -- transaction ID
+        current_setting('application_name'), -- client application
+        inet_client_addr(), -- client_addr
+        inet_client_port(), -- client_port
+        current_query(), -- top-level query or queries (if multistatement) from client
+        substring(TG_OP, 1, 1), -- action
+        NULL, -- row_data
+        NULL, -- changed_fields
+        NULL, -- old_data
+        NULL, -- new_data
+        'f', -- statement_only
+        row_uuid::uuid, -- safely extracted row UUID
+        actor_uuid::uuid, -- safely extracted actor UUID
+        gen_random_uuid(), -- UUID of the logged action
+        false -- archived
+    );
+    IF NOT TG_ARGV [0]::boolean IS DISTINCT FROM 'f'::boolean THEN
+        audit_row.client_query := NULL;
+    END IF;
+
+    IF TG_ARGV [1] IS NOT NULL THEN
+        excluded_cols := TG_ARGV [1]::text [];
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW' THEN
+        old_filtered := h_old - excluded_cols;
+        new_filtered := h_new - excluded_cols;
+
+        audit_row.row_data := old_filtered;
+        audit_row.old_data := old_filtered;
+        audit_row.new_data := new_filtered;
+
+        --Computing differences
+        SELECT jsonb_object_agg(n.key, n.value)
+        INTO audit_row.changed_fields
+        FROM jsonb_each_text(new_filtered) AS n
+        JOIN jsonb_each_text(old_filtered) AS o
+            ON n.key = o.key
+            AND n.value IS DISTINCT FROM o.value;
+
+        IF audit_row.changed_fields = '{}'::JSONB THEN -- All changed fields are ignored. Skip this update.
+        RETURN NULL;
+        END IF;
+    ELSIF TG_OP = 'DELETE' AND TG_LEVEL = 'ROW' THEN
+        audit_row.row_data := row_to_json(OLD)::JSONB - excluded_cols;
+        audit_row.old_data := row_to_json(OLD)::JSONB - excluded_cols;
+    ELSIF TG_OP = 'INSERT' AND TG_LEVEL = 'ROW' THEN
+        audit_row.row_data := row_to_json(NEW)::JSONB - excluded_cols;
+        audit_row.new_data := row_to_json(NEW)::JSONB - excluded_cols;
+    ELSIF TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE') THEN
+        audit_row.statement_only := 't';
+    ELSE
+        RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger for unhandled case: %, %',
+        TG_OP,
+        TG_LEVEL;
+        RETURN NULL;
+    END IF;
+    INSERT INTO audit.logged_actions VALUES (audit_row.*);
+    RETURN NULL;
 END;
 $body$ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog,
